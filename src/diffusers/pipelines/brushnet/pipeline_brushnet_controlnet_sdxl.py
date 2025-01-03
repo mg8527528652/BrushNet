@@ -1,18 +1,5 @@
 # Copyright 2024 The HuggingFace Team. All rights reserved.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -29,6 +16,7 @@ from transformers import (
 )
 
 from diffusers.utils.import_utils import is_invisible_watermark_available
+# from .multicontrolnet import MultiControlNetModel
 
 from ...image_processor import PipelineImageInput, VaeImageProcessor
 from ...loaders import (
@@ -37,7 +25,7 @@ from ...loaders import (
     StableDiffusionXLLoraLoaderMixin,
     TextualInversionLoaderMixin,
 )
-from ...models import AutoencoderKL, ControlNetModel, ImageProjection, UNet2DConditionModel
+from ...models import AutoencoderKL, BrushNetModel, ImageProjection, UNet2DConditionModel, ControlNetModel
 from ...models.attention_processor import (
     AttnProcessor2_0,
     LoRAAttnProcessor2_0,
@@ -62,8 +50,7 @@ from ..stable_diffusion_xl.pipeline_output import StableDiffusionXLPipelineOutpu
 if is_invisible_watermark_available():
     from ..stable_diffusion_xl.watermark import StableDiffusionXLWatermarker
 
-from .multicontrolnet import MultiControlNetModel
-
+# from .multibrushnet import MultiBrushNetModel
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -72,7 +59,7 @@ EXAMPLE_DOC_STRING = """
     Examples:
         ```py
         >>> # !pip install opencv-python transformers accelerate
-        >>> from diffusers import StableDiffusionXLControlNetPipeline, ControlNetModel, AutoencoderKL
+        >>> from diffusers import StableDiffusionXLBrushNetControlNetPipeline, BrushNetModel, ControlNetModel, AutoencoderKL
         >>> from diffusers.utils import load_image
         >>> import numpy as np
         >>> import torch
@@ -83,38 +70,54 @@ EXAMPLE_DOC_STRING = """
         >>> prompt = "aerial view, a futuristic research complex in a bright foggy jungle, hard lighting"
         >>> negative_prompt = "low quality, bad quality, sketches"
 
-        >>> # download an image
+        >>> # download images
         >>> image = load_image(
-        ...     "https://hf.co/datasets/hf-internal-testing/diffusers-images/resolve/main/sd_controlnet/hf-logo.png"
+        ...     "https://hf.co/datasets/hf-internal-testing/diffusers-images/resolve/main/sd_brushnet/hf-logo.png"
+        ... )
+        >>> control_image = load_image(
+        ...     "https://huggingface.co/datasets/hf-internal-testing/diffusers-images/resolve/main/controlnet/fill50k_openpose/00000.png"
         ... )
 
         >>> # initialize the models and pipeline
+        >>> brushnet_conditioning_scale = 0.5  # recommended for good generalization
         >>> controlnet_conditioning_scale = 0.5  # recommended for good generalization
+        
+        >>> brushnet = BrushNetModel.from_pretrained(
+        ...     "diffusers/brushnet-canny-sdxl-1.0", torch_dtype=torch.float16
+        ... )
         >>> controlnet = ControlNetModel.from_pretrained(
-        ...     "diffusers/controlnet-canny-sdxl-1.0", torch_dtype=torch.float16
+        ...     "diffusers/controlnet-openpose-sdxl-1.0", torch_dtype=torch.float16
         ... )
         >>> vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
-        >>> pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
-        ...     "stabilityai/stable-diffusion-xl-base-1.0", controlnet=controlnet, vae=vae, torch_dtype=torch.float16
+        >>> pipe = StableDiffusionXLBrushNetControlNetPipeline.from_pretrained(
+        ...     "stabilityai/stable-diffusion-xl-base-1.0", 
+        ...     brushnet=brushnet,
+        ...     controlnet=controlnet,
+        ...     vae=vae, 
+        ...     torch_dtype=torch.float16
         ... )
         >>> pipe.enable_model_cpu_offload()
 
-        >>> # get canny image
+        >>> # get canny image for brushnet
         >>> image = np.array(image)
         >>> image = cv2.Canny(image, 100, 200)
         >>> image = image[:, :, None]
         >>> image = np.concatenate([image, image, image], axis=2)
         >>> canny_image = Image.fromarray(image)
 
-        >>> # generate image
+        >>> # generate image with both brushnet and controlnet guidance
         >>> image = pipe(
-        ...     prompt, controlnet_conditioning_scale=controlnet_conditioning_scale, image=canny_image
-        ... ).images[0]
+        ...     prompt,
+        ...     image=canny_image,  # BrushNet condition
+        ...     control_image=control_image,  # ControlNet condition
+        ...     brushnet_conditioning_scale=brushnet_conditioning_scale,
+        ...     controlnet_conditioning_scale=controlnet_conditioning_scale,
+        ... ).images[0]                             
         ```
 """
 
 
-class StableDiffusionXLControlNetPipeline(
+class StableDiffusionXLBrushNetControlNetPipeline(
     DiffusionPipeline,
     StableDiffusionMixin,
     TextualInversionLoaderMixin,
@@ -123,7 +126,7 @@ class StableDiffusionXLControlNetPipeline(
     FromSingleFileMixin,
 ):
     r"""
-    Pipeline for text-to-image generation using Stable Diffusion XL with ControlNet guidance.
+    Pipeline for text-to-image generation using Stable Diffusion XL with BrushNet guidance.
 
     This model inherits from [`DiffusionPipeline`]. Check the superclass documentation for the generic methods
     implemented for all pipelines (downloading, saving, running on a particular device, etc.).
@@ -149,6 +152,10 @@ class StableDiffusionXLControlNetPipeline(
             A `CLIPTokenizer` to tokenize text.
         unet ([`UNet2DConditionModel`]):
             A `UNet2DConditionModel` to denoise the encoded image latents.
+        brushnet ([`BrushNetModel`] or `List[BrushNetModel]`):
+            Provides additional conditioning to the `unet` during the denoising process. If you set multiple
+            BrushNets as a list, the outputs from each BrushNet are added together to create one combined
+            additional conditioning.
         controlnet ([`ControlNetModel`] or `List[ControlNetModel]`):
             Provides additional conditioning to the `unet` during the denoising process. If you set multiple
             ControlNets as a list, the outputs from each ControlNet are added together to create one combined
@@ -165,7 +172,7 @@ class StableDiffusionXLControlNetPipeline(
             watermarker is used.
     """
 
-    # leave controlnet out on purpose because it iterates with unet
+    # leave brushnet out on purpose because it iterates with unet
     model_cpu_offload_seq = "text_encoder->text_encoder_2->image_encoder->unet->vae"
     _optional_components = [
         "tokenizer",
@@ -185,7 +192,8 @@ class StableDiffusionXLControlNetPipeline(
         tokenizer: CLIPTokenizer,
         tokenizer_2: CLIPTokenizer,
         unet: UNet2DConditionModel,
-        controlnet: Union[ControlNetModel, List[ControlNetModel], Tuple[ControlNetModel], MultiControlNetModel],
+        brushnet: Union[BrushNetModel, List[BrushNetModel], Tuple[BrushNetModel]],
+        controlnet: Union[ControlNetModel, List[ControlNetModel], Tuple[ControlNetModel]],
         scheduler: KarrasDiffusionSchedulers,
         force_zeros_for_empty_prompt: bool = True,
         add_watermarker: Optional[bool] = None,
@@ -194,8 +202,8 @@ class StableDiffusionXLControlNetPipeline(
     ):
         super().__init__()
 
-        if isinstance(controlnet, (list, tuple)):
-            controlnet = MultiControlNetModel(controlnet)
+        # if isinstance(controlnet, (list, tuple)):
+        #     controlnet = MultiControlNetModel(controlnet)
 
         self.register_modules(
             vae=vae,
@@ -204,6 +212,7 @@ class StableDiffusionXLControlNetPipeline(
             tokenizer=tokenizer,
             tokenizer_2=tokenizer_2,
             unet=unet,
+            brushnet=brushnet,
             controlnet=controlnet,
             scheduler=scheduler,
             feature_extractor=feature_extractor,
@@ -558,6 +567,8 @@ class StableDiffusionXLControlNetPipeline(
         prompt,
         prompt_2,
         image,
+        control_image,
+        mask,
         callback_steps,
         negative_prompt=None,
         negative_prompt_2=None,
@@ -567,6 +578,7 @@ class StableDiffusionXLControlNetPipeline(
         ip_adapter_image=None,
         ip_adapter_image_embeds=None,
         negative_pooled_prompt_embeds=None,
+        brushnet_conditioning_scale=1.0,
         controlnet_conditioning_scale=1.0,
         control_guidance_start=0.0,
         control_guidance_end=1.0,
@@ -635,68 +647,68 @@ class StableDiffusionXLControlNetPipeline(
 
         # `prompt` needs more sophisticated handling when there are multiple
         # conditionings.
-        if isinstance(self.controlnet, MultiControlNetModel):
-            if isinstance(prompt, list):
-                logger.warning(
-                    f"You have {len(self.controlnet.nets)} ControlNets and you have passed {len(prompt)}"
-                    " prompts. The conditionings will be fixed across the prompts."
-                )
+        # if isinstance(self.brushnet, MultiBrushNetModel):
+        #     if isinstance(prompt, list):
+        #         logger.warning(
+        #             f"You have {len(self.brushnet.nets)} BrushNets and you have passed {len(prompt)}"
+        #             " prompts. The conditionings will be fixed across the prompts."
+        #         )
 
         # Check `image`
         is_compiled = hasattr(F, "scaled_dot_product_attention") and isinstance(
-            self.controlnet, torch._dynamo.eval_frame.OptimizedModule
+            self.brushnet, torch._dynamo.eval_frame.OptimizedModule
         )
         if (
-            isinstance(self.controlnet, ControlNetModel)
+            isinstance(self.brushnet, BrushNetModel)
             or is_compiled
-            and isinstance(self.controlnet._orig_mod, ControlNetModel)
+            and isinstance(self.brushnet._orig_mod, BrushNetModel)
         ):
-            self.check_image(image, prompt, prompt_embeds)
-        elif (
-            isinstance(self.controlnet, MultiControlNetModel)
-            or is_compiled
-            and isinstance(self.controlnet._orig_mod, MultiControlNetModel)
-        ):
-            if not isinstance(image, list):
-                raise TypeError("For multiple controlnets: `image` must be type `list`")
+            self.check_image(image, mask, prompt, prompt_embeds)
+        # elif (
+        #     isinstance(self.brushnet, MultiBrushNetModel)
+        #     or is_compiled
+        #     and isinstance(self.brushnet._orig_mod, MultiBrushNetModel)
+        # ):
+        #     if not isinstance(image, list):
+        #         raise TypeError("For multiple brushnets: `image` must be type `list`")
 
-            # When `image` is a nested list:
-            # (e.g. [[canny_image_1, pose_image_1], [canny_image_2, pose_image_2]])
-            elif any(isinstance(i, list) for i in image):
-                raise ValueError("A single batch of multiple conditionings are supported at the moment.")
-            elif len(image) != len(self.controlnet.nets):
-                raise ValueError(
-                    f"For multiple controlnets: `image` must have the same length as the number of controlnets, but got {len(image)} images and {len(self.controlnet.nets)} ControlNets."
-                )
+        #     # When `image` is a nested list:
+        #     # (e.g. [[canny_image_1, pose_image_1], [canny_image_2, pose_image_2]])
+        #     elif any(isinstance(i, list) for i in image):
+        #         raise ValueError("A single batch of multiple conditionings are supported at the moment.")
+        #     elif len(image) != len(self.brushnet.nets):
+        #         raise ValueError(
+        #             f"For multiple brushnets: `image` must have the same length as the number of brushnets, but got {len(image)} images and {len(self.brushnet.nets)} BrushNets."
+        #         )
 
-            for image_ in image:
-                self.check_image(image_, prompt, prompt_embeds)
+        #     for image_ in image:
+        #         self.check_image(image_, prompt, prompt_embeds)
         else:
             assert False
 
-        # Check `controlnet_conditioning_scale`
+        # Check `brushnet_conditioning_scale`
         if (
-            isinstance(self.controlnet, ControlNetModel)
+            isinstance(self.brushnet, BrushNetModel)
             or is_compiled
-            and isinstance(self.controlnet._orig_mod, ControlNetModel)
+            and isinstance(self.brushnet._orig_mod, BrushNetModel)
         ):
-            if not isinstance(controlnet_conditioning_scale, float):
-                raise TypeError("For single controlnet: `controlnet_conditioning_scale` must be type `float`.")
-        elif (
-            isinstance(self.controlnet, MultiControlNetModel)
-            or is_compiled
-            and isinstance(self.controlnet._orig_mod, MultiControlNetModel)
-        ):
-            if isinstance(controlnet_conditioning_scale, list):
-                if any(isinstance(i, list) for i in controlnet_conditioning_scale):
-                    raise ValueError("A single batch of multiple conditionings are supported at the moment.")
-            elif isinstance(controlnet_conditioning_scale, list) and len(controlnet_conditioning_scale) != len(
-                self.controlnet.nets
-            ):
-                raise ValueError(
-                    "For multiple controlnets: When `controlnet_conditioning_scale` is specified as `list`, it must have"
-                    " the same length as the number of controlnets"
-                )
+            if not isinstance(brushnet_conditioning_scale, float):
+                raise TypeError("For single brushnet: `brushnet_conditioning_scale` must be type `float`.")
+        # elif (
+        #     isinstance(self.brushnet, MultiBrushNetModel)
+        #     or is_compiled
+        #     and isinstance(self.brushnet._orig_mod, MultiBrushNetModel)
+        # ):
+        #     if isinstance(brushnet_conditioning_scale, list):
+        #         if any(isinstance(i, list) for i in brushnet_conditioning_scale):
+        #             raise ValueError("A single batch of multiple conditionings are supported at the moment.")
+        #     elif isinstance(brushnet_conditioning_scale, list) and len(brushnet_conditioning_scale) != len(
+        #         self.brushnet.nets
+        #     ):
+        #         raise ValueError(
+        #             "For multiple brushnets: When `brushnet_conditioning_scale` is specified as `list`, it must have"
+        #             " the same length as the number of brushnets"
+        #         )
         else:
             assert False
 
@@ -711,11 +723,11 @@ class StableDiffusionXLControlNetPipeline(
                 f"`control_guidance_start` has {len(control_guidance_start)} elements, but `control_guidance_end` has {len(control_guidance_end)} elements. Make sure to provide the same number of elements to each list."
             )
 
-        if isinstance(self.controlnet, MultiControlNetModel):
-            if len(control_guidance_start) != len(self.controlnet.nets):
-                raise ValueError(
-                    f"`control_guidance_start`: {control_guidance_start} has {len(control_guidance_start)} elements but there are {len(self.controlnet.nets)} controlnets available. Make sure to provide {len(self.controlnet.nets)}."
-                )
+        # if isinstance(self.brushnet, MultiBrushNetModel):
+        #     if len(control_guidance_start) != len(self.brushnet.nets):
+        #         raise ValueError(
+        #             f"`control_guidance_start`: {control_guidance_start} has {len(control_guidance_start)} elements but there are {len(self.brushnet.nets)} brushnets available. Make sure to provide {len(self.brushnet.nets)}."
+        #         )
 
         for start, end in zip(control_guidance_start, control_guidance_end):
             if start >= end:
@@ -742,8 +754,24 @@ class StableDiffusionXLControlNetPipeline(
                     f"`ip_adapter_image_embeds` has to be a list of 3D or 4D tensors but is {ip_adapter_image_embeds[0].ndim}D"
                 )
 
-    # Copied from diffusers.pipelines.controlnet.pipeline_controlnet.StableDiffusionControlNetPipeline.check_image
-    def check_image(self, image, prompt, prompt_embeds):
+        # Add ControlNet checks
+        controlnet = self.controlnet._orig_mod if is_compiled_module(self.controlnet) else self.controlnet
+        
+        # if isinstance(self.controlnet, MultiControlNetModel):
+        #     if not isinstance(control_image, list):
+        #         raise TypeError("For multiple controlnets: `control_image` must be type `list`")
+        #     elif any(isinstance(i, list) for i in control_image):
+        #         raise ValueError("A single batch of multiple conditionings are supported at the moment.")
+        #     elif len(control_image) != len(self.controlnet.nets):
+        #         raise ValueError(
+        #             f"For multiple controlnets: `control_image` must have the same length as the number of controlnets, but got {len(control_image)} images and {len(self.controlnet.nets)} ControlNets."
+        #         )
+
+        #     for image_ in control_image:
+        #         self.check_image(image_, prompt, prompt_embeds)
+
+    # Copied from diffusers.pipelines.brushnet.pipeline_brushnet.StableDiffusionBrushNetPipeline.check_image
+    def check_image(self, image, mask, prompt, prompt_embeds):
         image_is_pil = isinstance(image, PIL.Image.Image)
         image_is_tensor = isinstance(image, torch.Tensor)
         image_is_np = isinstance(image, np.ndarray)
@@ -762,6 +790,26 @@ class StableDiffusionXLControlNetPipeline(
             raise TypeError(
                 f"image must be passed and be one of PIL image, numpy array, torch tensor, list of PIL images, list of numpy arrays or list of torch tensors, but is {type(image)}"
             )
+            
+        mask_is_pil = isinstance(mask, PIL.Image.Image)
+        mask_is_tensor = isinstance(mask, torch.Tensor)
+        mask_is_np = isinstance(mask, np.ndarray)
+        mask_is_pil_list = isinstance(mask, list) and isinstance(mask[0], PIL.Image.Image)
+        mask_is_tensor_list = isinstance(mask, list) and isinstance(mask[0], torch.Tensor)
+        mask_is_np_list = isinstance(mask, list) and isinstance(mask[0], np.ndarray)
+
+        if (
+            not mask_is_pil
+            and not mask_is_tensor
+            and not mask_is_np
+            and not mask_is_pil_list
+            and not mask_is_tensor_list
+            and not mask_is_np_list
+        ):
+            raise TypeError(
+                f"mask must be passed and be one of PIL image, numpy array, torch tensor, list of PIL images, list of numpy arrays or list of torch tensors, but is {type(mask)}"
+            )
+
 
         if image_is_pil:
             image_batch_size = 1
@@ -780,7 +828,7 @@ class StableDiffusionXLControlNetPipeline(
                 f"If image batch size is not 1, image batch size must be same as prompt batch size. image batch size: {image_batch_size}, prompt batch size: {prompt_batch_size}"
             )
 
-    # Copied from diffusers.pipelines.controlnet.pipeline_controlnet.StableDiffusionControlNetPipeline.prepare_image
+    # Copied from diffusers.pipelines.brushnet.pipeline_brushnet.StableDiffusionBrushNetPipeline.prepare_image
     def prepare_image(
         self,
         image,
@@ -793,7 +841,7 @@ class StableDiffusionXLControlNetPipeline(
         do_classifier_free_guidance=False,
         guess_mode=False,
     ):
-        image = self.control_image_processor.preprocess(image, height=height, width=width).to(dtype=torch.float32)
+        image = self.image_processor.preprocess(image, height=height, width=width).to(dtype=torch.float32)
         image_batch_size = image.shape[0]
 
         if image_batch_size == 1:
@@ -821,13 +869,13 @@ class StableDiffusionXLControlNetPipeline(
             )
 
         if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         else:
-            latents = latents.to(device)
+            noise = latents.to(device)
 
         # scale the initial noise by the standard deviation required by the scheduler
-        latents = latents * self.scheduler.init_noise_sigma
-        return latents
+        latents = noise * self.scheduler.init_noise_sigma
+        return latents, noise
 
     # Copied from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl.StableDiffusionXLPipeline._get_add_time_ids
     def _get_add_time_ids(
@@ -931,6 +979,8 @@ class StableDiffusionXLControlNetPipeline(
         prompt: Union[str, List[str]] = None,
         prompt_2: Optional[Union[str, List[str]]] = None,
         image: PipelineImageInput = None,
+        control_image: PipelineImageInput = None,
+        mask: PipelineImageInput = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 50,
@@ -951,6 +1001,7 @@ class StableDiffusionXLControlNetPipeline(
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        brushnet_conditioning_scale: Union[float, List[float]] = 1.0,
         controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
         guess_mode: bool = False,
         control_guidance_start: Union[float, List[float]] = 0.0,
@@ -977,11 +1028,27 @@ class StableDiffusionXLControlNetPipeline(
                 used in both text-encoders.
             image (`torch.FloatTensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.FloatTensor]`, `List[PIL.Image.Image]`, `List[np.ndarray]`,:
                     `List[List[torch.FloatTensor]]`, `List[List[np.ndarray]]` or `List[List[PIL.Image.Image]]`):
+                The BrushNet input condition to provide guidance to the `unet` for generation. If the type is
+                specified as `torch.FloatTensor`, it is passed to BrushNet as is. `PIL.Image.Image` can also be
+                accepted as an image. The dimensions of the output image defaults to `image`'s dimensions. If height
+                and/or width are passed, `image` is resized accordingly. If multiple BrushNets are specified in
+                `init`, images must be passed as a list such that each element of the list can be correctly batched for
+                input to a single BrushNet.
+            control_image (`torch.FloatTensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.FloatTensor]`, `List[PIL.Image.Image]`, `List[np.ndarray]`,:
+                    `List[List[torch.FloatTensor]]`, `List[List[np.ndarray]]` or `List[List[PIL.Image.Image]]`):
                 The ControlNet input condition to provide guidance to the `unet` for generation. If the type is
                 specified as `torch.FloatTensor`, it is passed to ControlNet as is. `PIL.Image.Image` can also be
-                accepted as an image. The dimensions of the output image defaults to `image`'s dimensions. If height
-                and/or width are passed, `image` is resized accordingly. If multiple ControlNets are specified in
+                accepted as an image. The dimensions of the output image defaults to `control_image`'s dimensions. If height
+                and/or width are passed, `control_image` is resized accordingly. If multiple ControlNets are specified in
                 `init`, images must be passed as a list such that each element of the list can be correctly batched for
+                input to a single ControlNet.
+            mask (`torch.FloatTensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.FloatTensor]`, `List[PIL.Image.Image]`, `List[np.ndarray]`,:
+                    `List[List[torch.FloatTensor]]`, `List[List[np.ndarray]]` or `List[List[PIL.Image.Image]]`):
+                The mask to apply to the `image` and `control_image` for conditioning. If the type is
+                specified as `torch.FloatTensor`, it is passed to ControlNet as is. `PIL.Image.Image` can also be
+                accepted as a mask. The dimensions of the output mask defaults to `image`'s dimensions. If height
+                and/or width are passed, `image` is resized accordingly. If multiple ControlNets are specified in
+                `init`, masks must be passed as a list such that each element of the list can be correctly batched for
                 input to a single ControlNet.
             height (`int`, *optional*, defaults to `self.unet.config.sample_size * self.vae_scale_factor`):
                 The height in pixels of the generated image. Anything below 512 pixels won't work well for
@@ -1049,17 +1116,21 @@ class StableDiffusionXLControlNetPipeline(
             cross_attention_kwargs (`dict`, *optional*):
                 A kwargs dictionary that if specified is passed along to the [`AttentionProcessor`] as defined in
                 [`self.processor`](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            brushnet_conditioning_scale (`float` or `List[float]`, *optional*, defaults to 1.0):
+                The outputs of the BrushNet are multiplied by `brushnet_conditioning_scale` before they are added
+                to the residual in the original `unet`. If multiple BrushNets are specified in `init`, you can set
+                the corresponding scale as a list.
             controlnet_conditioning_scale (`float` or `List[float]`, *optional*, defaults to 1.0):
                 The outputs of the ControlNet are multiplied by `controlnet_conditioning_scale` before they are added
                 to the residual in the original `unet`. If multiple ControlNets are specified in `init`, you can set
                 the corresponding scale as a list.
             guess_mode (`bool`, *optional*, defaults to `False`):
-                The ControlNet encoder tries to recognize the content of the input image even if you remove all
+                The BrushNet encoder tries to recognize the content of the input image even if you remove all
                 prompts. A `guidance_scale` value between 3.0 and 5.0 is recommended.
             control_guidance_start (`float` or `List[float]`, *optional*, defaults to 0.0):
-                The percentage of total steps at which the ControlNet starts applying.
+                The percentage of total steps at which the BrushNet starts applying.
             control_guidance_end (`float` or `List[float]`, *optional*, defaults to 1.0):
-                The percentage of total steps at which the ControlNet stops applying.
+                The percentage of total steps at which the BrushNet stops applying.
             original_size (`Tuple[int]`, *optional*, defaults to (1024, 1024)):
                 If `original_size` is not the same as `target_size` the image will appear to be down- or upsampled.
                 `original_size` defaults to `(height, width)` if not specified. Part of SDXL's micro-conditioning as
@@ -1126,7 +1197,7 @@ class StableDiffusionXLControlNetPipeline(
                 "Passing `callback_steps` as an input argument to `__call__` is deprecated, consider using `callback_on_step_end`",
             )
 
-        controlnet = self.controlnet._orig_mod if is_compiled_module(self.controlnet) else self.controlnet
+        brushnet = self.brushnet._orig_mod if is_compiled_module(self.brushnet) else self.brushnet
 
         # align format for control guidance
         if not isinstance(control_guidance_start, list) and isinstance(control_guidance_end, list):
@@ -1134,7 +1205,8 @@ class StableDiffusionXLControlNetPipeline(
         elif not isinstance(control_guidance_end, list) and isinstance(control_guidance_start, list):
             control_guidance_end = len(control_guidance_start) * [control_guidance_end]
         elif not isinstance(control_guidance_start, list) and not isinstance(control_guidance_end, list):
-            mult = len(controlnet.nets) if isinstance(controlnet, MultiControlNetModel) else 1
+            # mult = len(brushnet.nets) if isinstance(brushnet, MultiBrushNetModel) else 1
+            mult = 1
             control_guidance_start, control_guidance_end = (
                 mult * [control_guidance_start],
                 mult * [control_guidance_end],
@@ -1145,6 +1217,8 @@ class StableDiffusionXLControlNetPipeline(
             prompt,
             prompt_2,
             image,
+            control_image,
+            mask,
             callback_steps,
             negative_prompt,
             negative_prompt_2,
@@ -1154,6 +1228,7 @@ class StableDiffusionXLControlNetPipeline(
             ip_adapter_image,
             ip_adapter_image_embeds,
             negative_pooled_prompt_embeds,
+            brushnet_conditioning_scale,
             controlnet_conditioning_scale,
             control_guidance_start,
             control_guidance_end,
@@ -1175,13 +1250,13 @@ class StableDiffusionXLControlNetPipeline(
 
         device = self._execution_device
 
-        if isinstance(controlnet, MultiControlNetModel) and isinstance(controlnet_conditioning_scale, float):
-            controlnet_conditioning_scale = [controlnet_conditioning_scale] * len(controlnet.nets)
+        # if isinstance(brushnet, MultiBrushNetModel) and isinstance(brushnet_conditioning_scale, float):
+        #     brushnet_conditioning_scale = [brushnet_conditioning_scale] * len(brushnet.nets)
 
         global_pool_conditions = (
-            controlnet.config.global_pool_conditions
-            if isinstance(controlnet, ControlNetModel)
-            else controlnet.nets[0].config.global_pool_conditions
+            brushnet.config.global_pool_conditions
+            if isinstance(brushnet, BrushNetModel)
+            else brushnet.nets[0].config.global_pool_conditions
         )
         guess_mode = guess_mode or global_pool_conditions
 
@@ -1221,7 +1296,7 @@ class StableDiffusionXLControlNetPipeline(
             )
 
         # 4. Prepare image
-        if isinstance(controlnet, ControlNetModel):
+        if isinstance(brushnet, BrushNetModel):
             image = self.prepare_image(
                 image=image,
                 width=width,
@@ -1229,31 +1304,43 @@ class StableDiffusionXLControlNetPipeline(
                 batch_size=batch_size * num_images_per_prompt,
                 num_images_per_prompt=num_images_per_prompt,
                 device=device,
-                dtype=controlnet.dtype,
+                dtype=brushnet.dtype,
                 do_classifier_free_guidance=self.do_classifier_free_guidance,
                 guess_mode=guess_mode,
             )
+            original_mask = self.prepare_image(
+                image=mask,
+                width=width,
+                height=height,
+                batch_size=batch_size * num_images_per_prompt,
+                num_images_per_prompt=num_images_per_prompt,
+                device=device,
+                dtype=brushnet.dtype,
+                do_classifier_free_guidance=self.do_classifier_free_guidance,
+                guess_mode=guess_mode,
+            )
+            original_mask=(original_mask.sum(1)[:,None,:,:] < 0).to(image.dtype)
             height, width = image.shape[-2:]
-        elif isinstance(controlnet, MultiControlNetModel):
-            images = []
+        # elif isinstance(brushnet, MultiBrushNetModel):
+        #     images = []
 
-            for image_ in image:
-                image_ = self.prepare_image(
-                    image=image_,
-                    width=width,
-                    height=height,
-                    batch_size=batch_size * num_images_per_prompt,
-                    num_images_per_prompt=num_images_per_prompt,
-                    device=device,
-                    dtype=controlnet.dtype,
-                    do_classifier_free_guidance=self.do_classifier_free_guidance,
-                    guess_mode=guess_mode,
-                )
+        #     for image_ in image:
+        #         image_ = self.prepare_image(
+        #             image=image_,
+        #             width=width,
+        #             height=height,
+        #             batch_size=batch_size * num_images_per_prompt,
+        #             num_images_per_prompt=num_images_per_prompt,
+        #             device=device,
+        #             dtype=brushnet.dtype,
+        #             do_classifier_free_guidance=self.do_classifier_free_guidance,
+        #             guess_mode=guess_mode,
+        #         )
 
-                images.append(image_)
+        #         images.append(image_)
 
-            image = images
-            height, width = image[0].shape[-2:]
+        #     image = images
+        #     height, width = image[0].shape[-2:]
         else:
             assert False
 
@@ -1263,7 +1350,29 @@ class StableDiffusionXLControlNetPipeline(
         self._num_timesteps = len(timesteps)
 
         # 6. Prepare latent variables
-c
+        num_channels_latents = self.unet.config.in_channels
+        latents, noise = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+            latents,
+        )
+        
+        # 6.1 prepare condition latents
+        conditioning_latents=self.vae.encode(image).latent_dist.sample() * self.vae.config.scaling_factor
+        mask = torch.nn.functional.interpolate(
+                    original_mask, 
+                    size=(
+                        conditioning_latents.shape[-2], 
+                        conditioning_latents.shape[-1]
+                    )
+                )
+        conditioning_latents = torch.concat([conditioning_latents,mask],1)
+
 
         # 6.5 Optionally get Guidance Scale Embedding
         timestep_cond = None
@@ -1276,14 +1385,14 @@ c
         # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        # 7.1 Create tensor stating which controlnets to keep
-        controlnet_keep = []
+        # 7.1 Create tensor stating which brushnets to keep
+        brushnet_keep = []
         for i in range(len(timesteps)):
             keeps = [
                 1.0 - float(i / len(timesteps) < s or (i + 1) / len(timesteps) > e)
                 for s, e in zip(control_guidance_start, control_guidance_end)
             ]
-            controlnet_keep.append(keeps[0] if isinstance(controlnet, ControlNetModel) else keeps)
+            brushnet_keep.append(keeps[0] if isinstance(brushnet, BrushNetModel) else keeps)
 
         # 7.2 Prepare added time ids & embeddings
         if isinstance(image, list):
@@ -1346,13 +1455,13 @@ c
             timesteps = timesteps[:num_inference_steps]
 
         is_unet_compiled = is_compiled_module(self.unet)
-        is_controlnet_compiled = is_compiled_module(self.controlnet)
+        is_brushnet_compiled = is_compiled_module(self.brushnet)
         is_torch_higher_equal_2_1 = is_torch_version(">=", "2.1")
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # Relevant thread:
                 # https://dev-discuss.pytorch.org/t/cudagraphs-in-pytorch-2-0/1428
-                if (is_unet_compiled and is_controlnet_compiled) and is_torch_higher_equal_2_1:
+                if (is_unet_compiled and is_brushnet_compiled) and is_torch_higher_equal_2_1:
                     torch._inductor.cudagraph_mark_step_begin()
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
@@ -1360,46 +1469,47 @@ c
 
                 added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
 
-                # controlnet(s) inference
+                # brushnet(s) inference
                 if guess_mode and self.do_classifier_free_guidance:
-                    # Infer ControlNet only for the conditional batch.
+                    # Infer BrushNet only for the conditional batch.
                     control_model_input = latents
                     control_model_input = self.scheduler.scale_model_input(control_model_input, t)
-                    controlnet_prompt_embeds = prompt_embeds.chunk(2)[1]
-                    controlnet_added_cond_kwargs = {
+                    brushnet_prompt_embeds = prompt_embeds.chunk(2)[1]
+                    brushnet_added_cond_kwargs = {
                         "text_embeds": add_text_embeds.chunk(2)[1],
                         "time_ids": add_time_ids.chunk(2)[1],
                     }
                 else:
                     control_model_input = latent_model_input
-                    controlnet_prompt_embeds = prompt_embeds
-                    controlnet_added_cond_kwargs = added_cond_kwargs
+                    brushnet_prompt_embeds = prompt_embeds
+                    brushnet_added_cond_kwargs = added_cond_kwargs
 
-                if isinstance(controlnet_keep[i], list):
-                    cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[i])]
+                if isinstance(brushnet_keep[i], list):
+                    cond_scale = [c * s for c, s in zip(brushnet_conditioning_scale, brushnet_keep[i])]
                 else:
-                    controlnet_cond_scale = controlnet_conditioning_scale
-                    if isinstance(controlnet_cond_scale, list):
-                        controlnet_cond_scale = controlnet_cond_scale[0]
-                    cond_scale = controlnet_cond_scale * controlnet_keep[i]
+                    brushnet_cond_scale = brushnet_conditioning_scale
+                    if isinstance(brushnet_cond_scale, list):
+                        brushnet_cond_scale = brushnet_cond_scale[0]
+                    cond_scale = brushnet_cond_scale * brushnet_keep[i]
 
-                down_block_res_samples, mid_block_res_sample = self.controlnet(
+                down_block_res_samples, mid_block_res_sample, up_block_res_samples = self.brushnet(
                     control_model_input,
                     t,
-                    encoder_hidden_states=controlnet_prompt_embeds,
-                    controlnet_cond=image,
+                    encoder_hidden_states=brushnet_prompt_embeds,
+                    brushnet_cond=conditioning_latents,
                     conditioning_scale=cond_scale,
                     guess_mode=guess_mode,
-                    added_cond_kwargs=controlnet_added_cond_kwargs,
+                    added_cond_kwargs=brushnet_added_cond_kwargs,
                     return_dict=False,
                 )
 
                 if guess_mode and self.do_classifier_free_guidance:
-                    # Infered ControlNet only for the conditional batch.
-                    # To apply the output of ControlNet to both the unconditional and conditional batches,
+                    # Infered BrushNet only for the conditional batch.
+                    # To apply the output of BrushNet to both the unconditional and conditional batches,
                     # add 0 to the unconditional batch to keep it unchanged.
                     down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples]
                     mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
+                    up_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in up_block_res_samples]
 
                 if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
                     added_cond_kwargs["image_embeds"] = image_embeds
@@ -1411,8 +1521,9 @@ c
                     encoder_hidden_states=prompt_embeds,
                     timestep_cond=timestep_cond,
                     cross_attention_kwargs=self.cross_attention_kwargs,
-                    down_block_additional_residuals=down_block_res_samples,
-                    mid_block_additional_residual=mid_block_res_sample,
+                    down_block_add_samples=down_block_res_samples,
+                    mid_block_add_sample=mid_block_res_sample,
+                    up_block_add_samples=up_block_res_samples,
                     added_cond_kwargs=added_cond_kwargs,
                     return_dict=False,
                 )[0]

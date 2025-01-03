@@ -17,6 +17,8 @@ from .utils import (
     is_transformers_available,
 )
 
+from .pipelines.brushnet.pipeline_brushnet_controlnet_sdxl import StableDiffusionXLBrushNetControlNetPipeline
+
 
 # Lazy Import based on
 # https://github.com/huggingface/transformers/blob/main/src/transformers/__init__.py
@@ -291,6 +293,7 @@ else:
             "StableDiffusionUpscalePipeline",
             "StableDiffusionXLAdapterPipeline",
             "StableDiffusionXLBrushNetPipeline",
+            "StableDiffusionXLBrushNetControlNetPipeline",
             "StableDiffusionXLControlNetImg2ImgPipeline",
             "StableDiffusionXLControlNetInpaintPipeline",
             "StableDiffusionXLControlNetPipeline",
@@ -664,6 +667,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             StableDiffusionUpscalePipeline,
             StableDiffusionXLAdapterPipeline,
             StableDiffusionXLBrushNetPipeline,
+            StableDiffusionXLBrushNetControlNetPipeline,
             StableDiffusionXLControlNetImg2ImgPipeline,
             StableDiffusionXLControlNetInpaintPipeline,
             StableDiffusionXLControlNetPipeline,
@@ -787,3 +791,8 @@ else:
         module_spec=__spec__,
         extra_objects={"__version__": __version__},
     )
+
+__all__ = [
+    # ... existing entries ...
+    "StableDiffusionXLBrushNetControlNetPipeline",
+]
