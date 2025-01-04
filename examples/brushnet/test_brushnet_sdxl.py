@@ -7,10 +7,20 @@ from PIL import Image
 import json
 from tqdm import tqdm
 
-def load_input_images_and_prompt(image_path, mask_path, prompt):
+def load_input_images_and_prompt(image_path, mask_path = None, prompt = None):
     """Load and prepare input images and mask."""
     init_image = cv2.imread(image_path)[:,:,::-1]
-    mask_image = 1.*(cv2.imread(mask_path).sum(-1)>255)
+    # if mask is not provided, use the alpha channel of the image
+    if mask_path is None:
+        mask_image = cv2.imread(image_path, -1)[:,:,3]
+        mask_image = mask_image[:,:,np.newaxis]
+        mask_image = np.repeat(mask_image, 3, axis=2)
+    else:
+        mask_image = cv2.imread(mask_path)
+    # threshold mask image
+    mask_image = (mask_image > 128).astype(np.float32)
+    if mask_image.ndim == 3:
+        mask_image = mask_image.mean(axis=2)
     mask_image = 1.0 - mask_image
 
     # resize image
@@ -63,15 +73,22 @@ def generate_image_brushnet(pipe, prompt, init_image, mask_image, brushnet_condi
         brushnet_conditioning_scale=brushnet_conditioning_scale
     ).images[0]
 
-def postprocess_image_brushnet(image, init_image_path, mask_path, blended=False):
+def postprocess_image_brushnet(image, init_image_path, mask_path = None, blended=False):
     """Post-process the generated image with optional blending."""
     if not blended:
         return image
         
     image_np = np.array(image)
     init_image_np = cv2.imread(init_image_path)[:,:,::-1]
-    mask_np = 1.*(cv2.imread(mask_path).sum(-1)>255)[:,:,np.newaxis]
-    mask_image = 1.0 - mask_np
+    # if mask is not provided, use the alpha channel of the image
+    if mask_path is None:
+        mask_image = cv2.imread(init_image_path, -1)[:,:,3]
+        mask_image = mask_image[:,:,np.newaxis]
+        mask_image = mask_image.repeat(3,-1)
+    else:
+        mask_image = cv2.imread(mask_path)
+    mask_np = 1.*(mask_image.sum(-1)>255)
+    mask_np  = 1.0 - mask_np
 
     # Resize init_image_np and mask_np to match image_np dimensions
     image_h, image_w = image_np.shape[:2]
@@ -94,7 +111,7 @@ def main():
     output_folder = "output_images-rv2/"
     base_model_path = "RunDiffusion/Juggernaut-XL"
     brushnet_path = "/root/BrushNet/checkpoints/brushnet/segmentation_mask_brushnet_ckpt_sdxl_v1"
-    blended = False
+    blended = True
     brushnet_conditioning_scale = 1.0
 
     # Create output folder
