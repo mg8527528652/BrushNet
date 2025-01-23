@@ -28,7 +28,7 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
@@ -121,7 +121,13 @@ def log_validation(vae, unet, brushnet, args, accelerator, weight_dtype, step, i
         validation_mask = Image.open(validation_mask).convert("RGB")
         validation_mask = validation_mask.resize((args.resolution, args.resolution))
         
+        # invert mask
+        validation_mask = ImageOps.invert(validation_mask)
         validation_image = Image.composite(Image.new('RGB', (validation_image.size[0], validation_image.size[1]), (0, 0, 0)), validation_image, validation_mask.convert("L"))
+        
+        # validation_mask.save("validation_mask.png")
+        # validation_image.save("validation_image.png")
+        # validation_image = Image.composite(Image.new('RGB', (validation_image.size[0], validation_image.size[1]), (0, 0, 0)), validation_image, validation_mask.convert("L"))
 
 
         images = []
@@ -243,13 +249,14 @@ These are brushnet weights trained on {base_model} with new type of conditioning
     model_card.save(os.path.join(repo_folder, "README.md"))
 
 
+
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a BrushNet training script.")
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default=None,
-        required=True,
+        default='RunDiffusion/Juggernaut-XI-v11',
+        required=False,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -261,7 +268,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--brushnet_model_name_or_path",
         type=str,
-        default=None,
+        default='/root/BrushNet/examples/brushnet/models/inpaint/brushnet/segmentation_mask_brushnet_ckpt_sdxl_v1',
         help="Path to pretrained brushnet model or model identifier from huggingface.co/models."
         " If not specified brushnet weights are initialized from unet.",
     )
@@ -300,7 +307,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--resolution",
         type=int,
-        default=512,
+        default=1024,
         help=(
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
@@ -325,13 +332,13 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--max_train_steps",
         type=int,
-        default=None,
+        default=200000,
         help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
     )
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=500,
+        default=1000,
         help=(
             "Save a checkpoint of the training state every X updates. Checkpoints can be used for resuming training via `--resume_from_checkpoint`. "
             "In the case that the checkpoint is better than the final trained model, the checkpoint can also be used for inference."
@@ -343,13 +350,13 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--checkpoints_total_limit",
         type=int,
-        default=None,
+        default=150,
         help=("Max number of checkpoints to store."),
     )
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default=None,
+        default='latest',
         help=(
             "Whether training should be resumed from a previous checkpoint. Use a path saved by"
             ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
@@ -403,7 +410,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=0,
+        default=8,
         help=(
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
@@ -450,7 +457,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default=None,
+        default='fp16',
         choices=["no", "fp16", "bf16"],
         help=(
             "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
@@ -473,7 +480,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--dataset_name",
         type=str,
-        default=None,
+        default='mg8272/training_data_0.1M',
         help=(
             "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
             " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
@@ -502,7 +509,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--conditioning_image_column",
         type=str,
-        default="conditioning_image",
+        default="condtioning_image",
         help="The column of the dataset containing the brushnet conditioning image.",
     )
     parser.add_argument(
@@ -529,7 +536,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--validation_prompt",
         type=str,
-        default=["A cake on the table."],
+        default=["A cake on the table.", "A sofa in the room sunset light coming from the window.", "A vaseline on the table in a living room."],
         nargs="+",
         help=(
             "A set of prompts evaluated every `--validation_steps` and logged to `--report_to`."
@@ -540,7 +547,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--validation_image",
         type=str,
-        default=["examples/brushnet/src/test_image.jpg"],
+        default=["examples/brushnet/src/test_image.jpg", "/root/BrushNet/examples/brushnet/src/2_sofa.jpg", "/root/BrushNet/examples/brushnet/src/2_vaseline.jpg"],
         nargs="+",
         help=(
             "A set of paths to the brushnet conditioning image be evaluated every `--validation_steps`"
@@ -552,7 +559,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--validation_mask",
         type=str,
-        default=["examples/brushnet/src/test_mask.jpg"],
+        default=["examples/brushnet/src/test_mask.jpg", "/root/BrushNet/examples/brushnet/src/2_sofa_mask.jpg", "/root/BrushNet/examples/brushnet/src/2_vaseline_mask.jpg"],
         nargs="+",
         help=(
             "A set of paths to the paintingnet conditioning image be evaluated every `--validation_steps`"
@@ -564,13 +571,13 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--num_validation_images",
         type=int,
-        default=4,
+        default=2,
         help="Number of images to be generated for each `--validation_image`, `--validation_prompt` pair",
     )
     parser.add_argument(
         "--validation_steps",
         type=int,
-        default=100,
+        default=2,
         help=(
             "Run validation every X steps. Validation consists of running the prompt"
             " `args.validation_prompt` multiple times: `args.num_validation_images`"
@@ -794,6 +801,16 @@ def encode_prompt(prompt_batch, text_encoders, tokenizers, proportion_empty_prom
 #         "unet_added_conditions": {"text_embeds": add_text_embeds, "time_ids": add_time_ids},
 #     }
 
+def tokenize_captions(caption, original_size, crops_coords_top_left, target_size, text_encoders, tokenizers, is_train=True):
+    prompt_embeds, pooled_prompt_embeds = encode_prompt(
+        [caption], text_encoders, tokenizers, args.proportion_empty_prompts, is_train
+    )
+    add_text_embeds = pooled_prompt_embeds
+    add_time_ids = list(original_size + crops_coords_top_left + target_size)
+    add_time_ids = torch.tensor([add_time_ids])
+    
+    return {"prompt_embeds": prompt_embeds, "text_embeds": add_text_embeds, "time_ids": add_time_ids}
+
 
 
 class MyWebDataset():
@@ -891,38 +908,54 @@ class MyWebDataset():
         pixel_values=[]
         conditioning_pixel_values=[]
         masks=[]
-        prompt_embeds=[]
-        text_embeds=[]
-        time_ids=[]
-        
+        # prompt_embeds=[]
+        # text_embeds=[]
+        # time_ids=[]
+        crops_coords_top_left_list=[]
+        original_size_list=[]
+        target_size_list=[]
+        caption_list=[]
         for example in examples:
-            caption=example["caption"].decode('utf-8')
-            height=int(example["height"].decode('utf-8'))
-            width=int(example["width"].decode('utf-8'))
-            image = cv2.imdecode(np.asarray(bytearray(example["image"]), dtype="uint8"), cv2.IMREAD_COLOR)
-            segmentation = json.loads(example["segmentation"])
-
-            if len(segmentation["mask"])>0:
-                mask=self.rle2mask(random.choice(segmentation["mask"]),(height,width))[:,:,np.newaxis]
-            else:
-                mask=np.ones_like(image)[:,:,[0]]
+            caption_list.append(example["text"])
+            # height=int(example["height"].decode('utf-8'))
+            # width=int(example["width"].decode('utf-8'))
+            # image = cv2.imdecode(np.asarray(bytearray(example["image"]), dtype="uint8"), cv2.IMREAD_COLOR)
+            # segmentation = json.loads(example["segmentation"])
+            image  = example[args.image_column].convert('RGB')
+            mask = example[args.conditioning_image_column].convert('RGBA').split()[-1]
+            # convert mask to cv2 image
+            mask = np.array(mask)
+            # add a channel to the mask
+            mask = np.expand_dims(mask, axis=-1)
+            image = np.array(image)
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            height, width = image.shape[:2]
+            # if len(segmentation["mask"])>0:
+            #     mask=self.rle2mask(random.choice(segmentation["mask"]),(height,width))[:,:,np.newaxis]
+            # else:
+                # mask=np.ones_like(image)[:,:,[0]]
             
-            if self.random_mask:
-                mask = self.random_mask_gen(image.shape[0],image.shape[1])[0][:,:,np.newaxis]
+            # if self.random_mask:
+            #     mask = self.random_mask_gen(image.shape[0],image.shape[1])[0][:,:,np.newaxis]
 
             
             if random.random()<0.3:
                 kernel = np.ones((8,8),np.uint8)  
                 mask_erosion = cv2.erode(mask,kernel,iterations = 1)
                 mask_dilation = cv2.dilate(mask_erosion,kernel,iterations = 1)
-                mask=1*(mask_dilation>0)[:,:,np.newaxis]
+                mask=1.*(mask_dilation>0)[:,:,np.newaxis]
                 mask=mask.astype(np.uint8)
+            # Ensure the mask is normalized to have values between 0 and 1
+            mask = mask / 255.0
 
-            masked_image=image*mask
+            # Apply the mask to the image
+            masked_image = image * mask
 
-            if random.random()<0.5:
-                masked_image=image-masked_image
-                mask=1-mask
+            # Clip the values to ensure they are within the valid range for uint8
+            masked_image = np.clip(masked_image, 0, 255).astype(np.uint8)
+            # if random.random()<0.5:
+            #     masked_image=image-masked_image
+            mask=1-mask
             
             h,w,c=image.shape
             original_size = (h,w)
@@ -957,10 +990,14 @@ class MyWebDataset():
             masks.append(torch.tensor(mask).permute(2,0,1))
             # Here, we compute not just the text embeddings but also the additional embeddings
             # needed for the SD XL UNet to operate.
-            additional_embeds=self.tokenize_captions(caption, original_size, crops_coords_top_left, target_size)
-            prompt_embeds.append(additional_embeds["prompt_embeds"][0])
-            text_embeds.append(additional_embeds["text_embeds"][0])
-            time_ids.append(additional_embeds["time_ids"][0])
+            # additional_embeds=self.tokenize_captions(caption, original_size, crops_coords_top_left, target_size)
+            # prompt_embeds.append(additional_embeds["prompt_embeds"][0])
+            # text_embeds.append(additional_embeds["text_embeds"][0])
+            # time_ids.append(additional_embeds["time_ids"][0])
+            original_size_list.append(original_size)
+            crops_coords_top_left_list.append(crops_coords_top_left)
+            target_size_list.append(target_size)
+            # caption.append(caption)
 
         pixel_values = torch.stack(pixel_values)
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
@@ -968,22 +1005,27 @@ class MyWebDataset():
         conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
         masks = torch.stack(masks)
         masks = masks.to(memory_format=torch.contiguous_format).float()
-        prompt_embeds = torch.stack(prompt_embeds)
-        prompt_embeds = prompt_embeds.to(memory_format=torch.contiguous_format).float()
-        text_embeds = torch.stack(text_embeds)
-        text_embeds = text_embeds.to(memory_format=torch.contiguous_format).float()
-        time_ids = torch.stack(time_ids)
-        time_ids = time_ids.to(memory_format=torch.contiguous_format).float()
+        # prompt_embeds = torch.stack(prompt_embeds)
+        # prompt_embeds = prompt_embeds.to(memory_format=torch.contiguous_format).float()
+        # text_embeds = torch.stack(text_embeds)
+        # text_embeds = text_embeds.to(memory_format=torch.contiguous_format).float()
+        # time_ids = torch.stack(time_ids)
+        # time_ids = time_ids.to(memory_format=torch.contiguous_format).float()
 
         return {
             "pixel_values": pixel_values,
             "conditioning_pixel_values": conditioning_pixel_values,
             "masks":masks,
-            "prompt_embeds": prompt_embeds,
-            "unet_added_conditions": {
-            "text_embeds": text_embeds, 
-            "time_ids": time_ids,}
-        }
+            # "prompt_embeds": prompt_embeds,
+            # "unet_added_conditions": {
+            # "text_embeds": text_embeds, 
+            # "time_ids": time_ids,
+            "caption":caption_list,
+            "original_size":original_size_list,
+            "crops_coords_top_left":crops_coords_top_left_list,
+            "target_size":target_size_list,
+            }
+        
 
 def main(args):
     if args.report_to == "wandb" and args.hub_token is not None:
@@ -1066,10 +1108,16 @@ def main(args):
         if args.pretrained_vae_model_name_or_path is None
         else args.pretrained_vae_model_name_or_path
     )
-    if accelerator.mixed_precision == "fp16":
-        vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
-    else:
-        vae = AutoencoderKL.from_pretrained(
+    # if accelerator.mixed_precision == "fp16":
+    #     vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
+    # else:
+    #     vae = AutoencoderKL.from_pretrained(
+    #         vae_path,
+    #         subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None,
+    #         revision=args.revision,
+    #         variant=args.variant,
+    #     )
+    vae = AutoencoderKL.from_pretrained(
             vae_path,
             subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None,
             revision=args.revision,
@@ -1212,11 +1260,21 @@ def main(args):
     # from memory.
     text_encoders = [text_encoder_one, text_encoder_two]
     tokenizers = [tokenizer_one, tokenizer_two]
-    train_dataset = load_dataset("webdataset", 
-                    data_files={"train": os.path.join(args.train_data_dir,"*.tar")}, 
-                    split="train", 
-                    streaming=True)
-    train_dataset_len= 10000*len(os.listdir(args.train_data_dir))
+    # train_dataset = load_dataset("webdataset", 
+    #                 data_files={"train": os.path.join(args.train_data_dir,"*.tar")}, 
+    #                 split="train", 
+    #                 streaming=True)
+    train_dataset = load_dataset(
+        args.dataset_name,
+        args.dataset_config_name,
+        cache_dir=args.cache_dir,
+        num_proc=16
+    )
+    with accelerator.main_process_first():
+        train_dataset = train_dataset["train"].shuffle(seed=args.seed)
+        if args.max_train_samples is not None:
+            train_dataset = train_dataset.select(range(args.max_train_samples))
+    train_dataset_len= len(train_dataset)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=False,
@@ -1350,7 +1408,7 @@ def main(args):
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-
+    min_loss = 0.0033905887976288795
     image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
@@ -1383,7 +1441,6 @@ def main(args):
                         latents.shape[-1]
                     )
                 )
-
                 conditioning_latents=torch.concat([conditioning_latents,masks],1)
 
                 # Sample noise that we'll add to the latents
@@ -1397,10 +1454,26 @@ def main(args):
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                batch["prompt_embeds"]=batch["prompt_embeds"].to(weight_dtype)
-                batch["unet_added_conditions"]={"text_embeds":batch["unet_added_conditions"]["text_embeds"].to(weight_dtype),
-                                                "time_ids":batch["unet_added_conditions"]["time_ids"].to(weight_dtype)}
+                prompt_embeds=[]
+                text_embeds=[]
+                time_ids=[]
+                for i in range(bsz):
+                    additional_embeds=tokenize_captions(batch["caption"][i] , batch["original_size"][i], batch["crops_coords_top_left"][i], batch["target_size"][i], text_encoders, tokenizers)
+                    prompt_embeds.append(additional_embeds["prompt_embeds"][0])
+                    text_embeds.append(additional_embeds["text_embeds"][0])
+                    time_ids.append(additional_embeds["time_ids"][0])
+                prompt_embeds = torch.stack(prompt_embeds)
+                prompt_embeds = prompt_embeds.to(memory_format=torch.contiguous_format).float()
+                text_embeds = torch.stack(text_embeds)
+                text_embeds = text_embeds.to(memory_format=torch.contiguous_format).float()
+                time_ids = torch.stack(time_ids)
+                time_ids = time_ids.to(memory_format=torch.contiguous_format).float()
+                 # "prompt_embeds": prompt_embeds,
+            # "unet_added_conditions": {
+            # "text_embeds": text_embeds, 
+            # "time_ids": time_ids,                        
+                batch["prompt_embeds"]=prompt_embeds.to(weight_dtype)
+                batch["unet_added_conditions"]={"text_embeds":text_embeds.to(weight_dtype),"time_ids":time_ids.to(weight_dtype).to('cuda')}
 
                 down_block_res_samples, mid_block_res_sample, up_block_res_samples = brushnet(
                     noisy_latents,
@@ -1435,7 +1508,15 @@ def main(args):
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
+                min_loss = min(min_loss, loss)
+                if min_loss >= loss:
+                    # save the model
+                    accelerator.save_state(os.path.join(args.output_dir, f"best_checkpoint"))
+                    logger.info(f"Saved state to {os.path.join(args.output_dir, f'best_checkpoint')}")
+                    min_loss = loss     
+                    # save step and loss in a txt
+                    with open(os.path.join(args.output_dir, f'best_checkpoint.txt'), 'w') as f:
+                        f.write(f"Step: {global_step}, Loss: {loss}")
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     params_to_clip = brushnet.parameters()
